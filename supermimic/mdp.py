@@ -112,15 +112,16 @@ class MDP:
         p, R, v, w, q, qd = S
         bp, bR, bv, bw = self.kin.forward(p, R, v, w, q, qd)
         rp, rR = m.root_p[f], m.root_R[f]
+        ref_p, ref_R, ref_v, ref_w = m.bodies(f)
         # reference bodies re-anchored to the robot's root (xy + yaw), as in BeyondMimic
         dR = yaw_mat(R @ rR.transpose(-1, -2))
         anchor = torch.cat((p[..., :2], rp[..., 2:3]), -1)
-        ref_bp = anchor.unsqueeze(-2) + ((dR.unsqueeze(-3) @ (m.body_p[f] - rp.unsqueeze(-2)).unsqueeze(-1)).squeeze(-1))
-        ref_bR = dR.unsqueeze(-3) @ m.body_R[f]
+        ref_bp = anchor.unsqueeze(-2) + ((dR.unsqueeze(-3) @ (ref_p - rp.unsqueeze(-2)).unsqueeze(-1)).squeeze(-1))
+        ref_bR = dR.unsqueeze(-3) @ ref_R
         e_pos = ((ref_bp - bp) ** 2).sum(-1).mean(-1)
         e_ori = rot_angle_sq(ref_bR, bR).mean(-1)
-        e_lv = ((m.body_v[f] - bv) ** 2).sum(-1).mean(-1)
-        e_av = ((m.body_w[f] - bw) ** 2).sum(-1).mean(-1)
+        e_lv = ((ref_v - bv) ** 2).sum(-1).mean(-1)
+        e_av = ((ref_w - bw) ** 2).sum(-1).mean(-1)
         e_rp = ((rp - p) ** 2).sum(-1)
         e_ro = rot_angle_sq(rR, R)
         r_track = (
@@ -171,7 +172,7 @@ class MDP:
         bp = self.kin.forward(p, R, v, w, q, qd)[0]
         dR = yaw_mat(R @ rR.transpose(-1, -2))
         anchor = torch.cat((p[..., :2], rp[..., 2:3]), -1)
-        ref_bp = anchor.unsqueeze(-2) + ((dR.unsqueeze(-3) @ (m.body_p[f] - rp.unsqueeze(-2)).unsqueeze(-1)).squeeze(-1))
+        ref_bp = anchor.unsqueeze(-2) + ((dR.unsqueeze(-3) @ (m.bodies(f)[0] - rp.unsqueeze(-2)).unsqueeze(-1)).squeeze(-1))
         e_body = (Ht.unsqueeze(-3) @ (ref_bp - bp).unsqueeze(-1)).squeeze(-1).flatten(-2)
         e_root = (Ht @ (rp - p).unsqueeze(-1)).squeeze(-1)
         rel = mat_to_6d(R.transpose(-1, -2) @ rR)
