@@ -1,0 +1,7 @@
+# Build context is the repo root; only ship what docker/Dockerfile copies.
+*
+!supermimic/
+!tools/
+!docker/
+!run_train.sh
+**/__pycache__

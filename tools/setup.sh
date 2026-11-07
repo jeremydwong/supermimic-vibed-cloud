@@ -8,4 +8,4 @@ if [ ! -d IsaacLab ]; then
 fi
 git -C IsaacLab checkout "$ISAACLAB_COMMIT"
 (cd IsaacLab && docker build -f docker/Dockerfile.kitless -t isaac-lab-kitless:main-46d6cc3 .)
-docker build -t supermimic:latest docker/
+docker build -f docker/Dockerfile -t supermimic:latest .
