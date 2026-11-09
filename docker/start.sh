@@ -47,12 +47,16 @@ mkdir -p "$VOL/data" "$VOL/logs" "$VOL/.cache"
 for d in data logs .cache; do ln -sfn "$VOL/$d" "/opt/supermimic/$d"; done
 [ -n "${RUNPOD_API_KEY:-}" ] && [ -n "${RUNPOD_POD_ID:-}" ] || echo "[start.sh] WARNING: RUNPOD_API_KEY/RUNPOD_POD_ID missing; auto-stop will not work" | tee -a "$VOL/start.log"
 
-# budget is wall-clock time since first boot (conservative: stopped time counts too), so restarts don't reset it
-[ -f "$VOL/.first_boot" ] || date +%s > "$VOL/.first_boot"
-LEFT=$(python3 -c "import time; print(int($BUDGET_HOURS * 3600 - (time.time() - $(cat "$VOL/.first_boot"))))")
-echo "[start.sh] $(date -u +%FT%TZ) boot; budget left ${LEFT}s" | tee -a "$VOL/start.log"
-if [ "$LEFT" -le 0 ]; then stop_pod "budget spent"; exec sleep infinity; fi
-(sleep "$LEFT"; stop_pod "budget of ${BUDGET_HOURS} h reached") &
+# budget is running time summed over all boots of this volume (.used_seconds, ticked every 30 s), so a restart
+# continues it rather than resetting it, and time spent stopped does not count
+BUDGET_S=$(python3 -c "print(int($BUDGET_HOURS * 3600))")
+USED=$(cat "$VOL/.used_seconds" 2>/dev/null || echo 0)
+echo "[start.sh] $(date -u +%FT%TZ) boot; budget left $((BUDGET_S - USED))s" | tee -a "$VOL/start.log"
+if [ "$USED" -ge "$BUDGET_S" ]; then stop_pod "budget spent"; exec sleep infinity; fi
+(while sleep 30; do
+  USED=$((USED + 30)) && echo "$USED" > "$VOL/.used_seconds"
+  if [ "$USED" -ge "$BUDGET_S" ]; then stop_pod "budget of ${BUDGET_HOURS} h reached"; exit; fi
+done) &
 
 # preflight: fail fast, before any long step, if the environment is broken
 if ! python -c "import isaaclab, isaaclab_newton, torch; assert torch.cuda.is_available() or '${SKIP_GPU_CHECK:-0}' == '1', 'no CUDA GPU visible'" >> "$VOL/start.log" 2>&1; then
@@ -73,27 +77,28 @@ done
 if ! data_ok; then stop_pod "data setup FAILED after 3 attempts, see start.log"; exec sleep infinity; fi
 echo "[start.sh] data ok" | tee -a "$VOL/start.log"
 
-# BONES-SEED: stream-extract the G1 archive (23.5 GB -> 48 GB of CSVs), pack to 50 Hz, verify, drop the CSVs
+# BONES-SEED: stream the G1 archive (23.5 GB, 142k CSVs) straight into the 50 Hz packer and verify the result. The
+# CSVs are never extracted: writing that many small files to the network volume is slow (and tar cannot chown there).
 bones_ok() {
   [ -f "$BONES_NPZ" ] && [ "$(python -c "import numpy as np; print(len(np.load('$BONES_NPZ')['lens']))" 2>/dev/null)" = "$BONES_CLIPS" ]
 }
 bones_setup() {
   local HFD=https://huggingface.co/datasets/bones-studio/seed/resolve/main
-  rm -rf "$BONES/g1" && mkdir -p "$BONES/metadata"
+  mkdir -p "$BONES/metadata"
   curl -sfL --retry 3 -H "Authorization: Bearer $HF_TOKEN" -o "$BONES/metadata/seed_metadata_v004.parquet" "$HFD/metadata/seed_metadata_v004.parquet" || return 1
-  curl -sfL --retry 3 -H "Authorization: Bearer $HF_TOKEN" "$HFD/g1.tar.gz" | tar -xz -C "$BONES" || return 1
   python -c "import pandas, pyarrow" 2>/dev/null || pip install -q pandas pyarrow || return 1
-  python tools/pack_motions.py "$BONES/g1/csv" "$BONES_NPZ" --metadata "$BONES/metadata/seed_metadata_v004.parquet" --drop_support_props
+  curl -sfL --retry 3 -H "Authorization: Bearer $HF_TOKEN" "$HFD/g1.tar.gz" \
+    | python tools/pack_motions.py - "$BONES_NPZ" --metadata "$BONES/metadata/seed_metadata_v004.parquet" --drop_support_props
 }
 if [ "$MOTIONS" = bones ]; then
+  [ -d "$BONES/g1" ] && (rm -rf "$BONES/g1" &)  # CSVs left by the earlier extract-to-disk setup
   for attempt in 1 2 3; do
     bones_ok && break
     [ -n "${HF_TOKEN:-}" ] || break
     echo "[start.sh] $(date -u +%FT%TZ) BONES-SEED setup attempt $attempt" | tee -a "$VOL/start.log"
-    bones_setup >> "$VOL/start.log" 2>&1
+    bones_setup 2>&1 | tee -a "$VOL/start.log"
   done
   if ! bones_ok; then stop_pod "BONES-SEED setup FAILED (HF_TOKEN set: ${HF_TOKEN:+yes}), see start.log"; exec sleep infinity; fi
-  rm -rf "$BONES/g1"
   echo "[start.sh] $(date -u +%FT%TZ) BONES-SEED ok" | tee -a "$VOL/start.log"
 fi
 

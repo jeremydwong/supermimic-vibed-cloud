@@ -1,18 +1,23 @@
-"""Pack a directory of G1 retarget CSVs (LAFAN1 or BONES-SEED) into one 50 Hz .npz for MotionLib.from_packed.
+"""Pack G1 retarget CSVs (LAFAN1 or BONES-SEED) into one 50 Hz .npz for MotionLib.from_packed.
 
     python tools/pack_motions.py data/bones_seed/g1/csv data/bones_seed/g1_50hz.npz \
         [--metadata data/bones_seed/metadata/seed_metadata_v004.parquet --drop_support_props --originals_only]
+    curl ... g1.tar.gz | python tools/pack_motions.py - data/bones_seed/g1_50hz_noprops.npz --metadata ...
 
-Parsing ~142k CSVs takes a while, so it runs once (in parallel) rather than at every training start.
+The source is a directory searched recursively for *.csv, or a tar(.gz) archive of them (a path, or - for stdin).
+An archive is read as a stream, so its ~142k small CSVs never touch the disk (slow on RunPod's network volumes).
+Parsing takes a while, so it runs once (in parallel) rather than at every training start.
 """
 
 import argparse
 import glob
+import itertools
 import os
-import sys
-from multiprocessing import Pool
-
 import re
+import sys
+import tarfile
+import threading
+from multiprocessing import Pool
 
 import numpy as np
 
@@ -20,22 +25,33 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from supermimic.motion_io import read_clip, resample  # noqa: E402
 
 MIN_FRAMES = 2  # finite differences need at least two frames per clip
+IN_FLIGHT = 4096  # archive members read ahead of the parsing workers (bounds memory)
 # BONES-SEED props the body rests on, climbs or pushes against; the simulation has only a flat floor. Our reconstruction
 # of the paper's filter: it keeps 130,304 of 142,220 motions (the paper reports 129,514). Hand-held objects are kept.
 SUPPORT_PROPS = re.compile(r"box|crate|chair|wall|table|crutch|obstacle|ladder|stairs|pad|edge|bench|railing|^scaffolding$|tree \(scaffolding\)|log|cupboard|fridge")
 
 
-def load(path):
+def load(item):
+    path, data = item  # data: the CSV's bytes, or None to read it from path
     try:
-        p, quat, j = resample(*read_clip(path))
+        p, quat, j = resample(*read_clip(path if data is None else data))
     except Exception as e:  # a malformed file is reported and skipped, not fatal
         return path, None, repr(e)
     return path, (p.numpy(), quat.numpy(), j.numpy()), None
 
 
+def archive_members(src, wanted, slots):
+    """(path, bytes) of the wanted *.csv members of a tar(.gz) stream, at most IN_FLIGHT ahead of the consumer."""
+    with tarfile.open(fileobj=sys.stdin.buffer, mode="r|*") if src == "-" else tarfile.open(src, mode="r|*") as tar:
+        for m in tar:
+            if m.isfile() and m.name.endswith(".csv") and wanted(m.name):
+                slots.acquire()
+                yield m.name, tar.extractfile(m).read()
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("src", help="directory searched recursively for *.csv")
+    ap.add_argument("src", help="directory searched recursively for *.csv, or a tar(.gz) of them (- for stdin)")
     ap.add_argument("out", help="output .npz")
     ap.add_argument("--metadata", help="BONES-SEED metadata parquet, needed by the filters below")
     ap.add_argument("--originals_only", action="store_true", help="drop the mirrored BONES-SEED copies")
@@ -44,7 +60,7 @@ def main():
     ap.add_argument("--workers", type=int, default=os.cpu_count())
     args = ap.parse_args()
 
-    files = sorted(glob.glob(os.path.join(args.src, "**", "*.csv"), recursive=True))
+    keep = None
     if args.originals_only or args.drop_support_props:
         import pandas as pd
 
@@ -56,27 +72,43 @@ def main():
             props = meta.content_props.astype(str).str.lower().str.replace(",", ";").str.split(";")
             ok &= ~props.apply(lambda ts: any(SUPPORT_PROPS.search(t.strip()) for t in ts))
         keep = {os.path.basename(x) for x in meta.move_g1_path[ok]}
-        files = [f for f in files if os.path.basename(f) in keep]
-    if args.limit:
-        files = files[: args.limit]
-    print(f"packing {len(files)} files with {args.workers} workers")
+    wanted = lambda f: keep is None or os.path.basename(f) in keep  # noqa: E731
 
-    names, P, Q, J, lens, bad = [], [], [], [], [], []
+    slots = threading.BoundedSemaphore(IN_FLIGHT)
+    if os.path.isdir(args.src):
+        files = [f for f in sorted(glob.glob(os.path.join(args.src, "**", "*.csv"), recursive=True)) if wanted(f)]
+        if args.limit:
+            files = files[: args.limit]
+        items, total = ((f, None) for f in files), len(files)
+        print(f"packing {total} files with {args.workers} workers")
+    else:
+        items = archive_members(args.src, wanted, slots)
+        if args.limit:
+            items = itertools.islice(items, args.limit)
+        total = "?"
+        print(f"packing the CSVs of {args.src} with {args.workers} workers")
+
+    clips, bad = {}, []
     with Pool(args.workers) as pool:
-        for i, (path, clip, err) in enumerate(pool.imap(load, files, chunksize=64)):
+        for i, (path, clip, err) in enumerate(pool.imap(load, items, chunksize=64)):
+            if not os.path.isdir(args.src):
+                slots.release()
             if clip is None or len(clip[0]) < MIN_FRAMES:
                 bad.append((path, err or "too short"))
-                continue
-            names.append(os.path.splitext(os.path.basename(path))[0])
-            P.append(clip[0]), Q.append(clip[1]), J.append(clip[2]), lens.append(len(clip[0]))
+            else:
+                clips[path] = clip
             if (i + 1) % 5000 == 0:
-                print(f"  {i + 1}/{len(files)}", flush=True)
+                print(f"  {i + 1}/{total}", flush=True)
     for path, err in bad[:20]:
         print("skipped", path, err)
+    paths = sorted(clips)  # the same order whether read from a directory or from an archive
+    names = [os.path.splitext(os.path.basename(f))[0] for f in paths]
+    lens = [len(clips[f][0]) for f in paths]
     n = sum(lens)
     print(f"{len(lens)} clips, {len(bad)} skipped, {n} frames = {n * 0.02 / 3600:.1f} h at 50 Hz")
     np.savez(args.out, names=np.array(names), lens=np.array(lens, dtype=np.int64),
-             p=np.concatenate(P), quat=np.concatenate(Q), j=np.concatenate(J))  # fmt: skip
+             p=np.concatenate([clips[f][0] for f in paths]), quat=np.concatenate([clips[f][1] for f in paths]),
+             j=np.concatenate([clips[f][2] for f in paths]))  # fmt: skip
     print("wrote", args.out, f"{os.path.getsize(args.out) / 1e9:.2f} GB")
 
 

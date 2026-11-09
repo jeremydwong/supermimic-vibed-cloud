@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import io
+
 import numpy as np
 import torch
 
@@ -27,15 +29,21 @@ def euler_xyz_deg_to_quat(e: torch.Tensor) -> torch.Tensor:
     return mat_to_quat(R)
 
 
-def read_clip(path: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
-    """One G1 retarget CSV -> root position (T,3) m, root quaternion wxyz (T,4), joints (T,29) rad, source fps.
+def read_clip(src: str | bytes) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
+    """One G1 retarget CSV (a path, or the file's bytes) -> root position (T,3) m, root quaternion wxyz (T,4),
+    joints (T,29) rad, source fps.
 
     LAFAN1 (no header, 30 fps): x y z [m], qx qy qz qw, 29 joints [rad].
     BONES-SEED (header row, 120 fps): Frame, root translate [cm], root rotate (extrinsic xyz) [deg], 29 joints [deg].
     """
-    with open(path) as fh:
-        bones = fh.readline().startswith("Frame,")
-    raw = torch.tensor(np.loadtxt(path, delimiter=",", skiprows=int(bones), ndmin=2), dtype=torch.float32)
+    if isinstance(src, bytes):
+        src = io.StringIO(src.decode())
+        bones = src.readline().startswith("Frame,")
+        src.seek(0)
+    else:
+        with open(src) as fh:
+            bones = fh.readline().startswith("Frame,")
+    raw = torch.tensor(np.loadtxt(src, delimiter=",", skiprows=int(bones), ndmin=2), dtype=torch.float32)
     if bones:
         return raw[:, 1:4] / 100.0, euler_xyz_deg_to_quat(raw[:, 4:7]), torch.deg2rad(raw[:, 7:36]), BONES_FPS
     q_xyzw = raw[:, 3:7]
