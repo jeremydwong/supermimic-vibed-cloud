@@ -21,7 +21,8 @@ COPY supermimic/ /opt/supermimic/supermimic/
 COPY tools/ /opt/supermimic/tools/
 COPY docker/ /opt/supermimic/docker/
 COPY run_train.sh /opt/supermimic/
+# Kernel caches stay on the container disk: on RunPod's network volume Triton fails with "Stale file handle".
 ENV HOME=/root MPLCONFIGDIR=/tmp/mpl \
-    WARP_CACHE_PATH=/opt/supermimic/.cache/warp TORCHINDUCTOR_CACHE_DIR=/opt/supermimic/.cache/inductor
+    WARP_CACHE_PATH=/root/.cache/warp TORCHINDUCTOR_CACHE_DIR=/root/.cache/inductor
 WORKDIR /opt/supermimic
 CMD ["bash", "/opt/supermimic/docker/start.sh"]
