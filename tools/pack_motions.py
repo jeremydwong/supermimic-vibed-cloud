@@ -20,6 +20,7 @@ import threading
 from multiprocessing import Pool
 
 import numpy as np
+import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from supermimic.motion_io import read_clip, resample  # noqa: E402
@@ -29,6 +30,21 @@ IN_FLIGHT = 4096  # archive members read ahead of the parsing workers (bounds me
 # BONES-SEED props the body rests on, climbs or pushes against; the simulation has only a flat floor. Our reconstruction
 # of the paper's filter: it keeps 130,304 of 142,220 motions (the paper reports 129,514). Hand-held objects are kept.
 SUPPORT_PROPS = re.compile(r"box|crate|chair|wall|table|crutch|obstacle|ladder|stairs|pad|edge|bench|railing|^scaffolding$|tree \(scaffolding\)|log|cupboard|fridge")
+
+
+def cpu_count():
+    """CPUs this process may use: the cgroup quota (a RunPod pod sees all of the host's cores), else the affinity."""
+    try:
+        quota, period = open("/sys/fs/cgroup/cpu.max").read().split()
+        if quota != "max":
+            return max(1, int(quota) // int(period))
+    except (OSError, ValueError):
+        pass
+    return len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count()
+
+
+def init_worker():
+    torch.set_num_threads(1)  # parallelism is across clips; per-clip torch ops are tiny
 
 
 def load(item):
@@ -57,7 +73,7 @@ def main():
     ap.add_argument("--originals_only", action="store_true", help="drop the mirrored BONES-SEED copies")
     ap.add_argument("--drop_support_props", action="store_true", help="drop motions that need a box, chair, wall, ... (SUPPORT_PROPS)")
     ap.add_argument("--limit", type=int, default=0, help="pack only the first N files (for testing)")
-    ap.add_argument("--workers", type=int, default=os.cpu_count())
+    ap.add_argument("--workers", type=int, default=cpu_count())
     args = ap.parse_args()
 
     keep = None
@@ -89,7 +105,7 @@ def main():
         print(f"packing the CSVs of {args.src} with {args.workers} workers")
 
     clips, bad = {}, []
-    with Pool(args.workers) as pool:
+    with Pool(args.workers, initializer=init_worker) as pool:
         for i, (path, clip, err) in enumerate(pool.imap(load, items, chunksize=64)):
             if not os.path.isdir(args.src):
                 slots.release()
